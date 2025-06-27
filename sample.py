@@ -12,15 +12,9 @@ def get_candlestick_patterns(company_ticker, start_date, end_date):
             print(f"No data found for {company_ticker} between {start_date} and {end_date}.")
             return None
 
-        # --- FIX STARTS HERE ---
         # If columns are MultiIndex, flatten them to a single level
         if isinstance(data.columns, pd.MultiIndex):
-            # Option 1: Access the first level of the MultiIndex (usually the OHLCV names)
             data.columns = data.columns.get_level_values(0)
-            # Or, if you want to include the ticker, you could do:
-            # data.columns = [f"{col[0]}_{col[1]}" for col in data.columns]
-            # But for TA-Lib, just the OHLCV name is needed.
-        # --- FIX ENDS HERE ---
 
         # Standardize column names to uppercase
         new_columns = []
@@ -28,17 +22,13 @@ def get_candlestick_patterns(company_ticker, start_date, end_date):
             if isinstance(col, str):
                 new_columns.append(col.upper())
             else:
-                # Fallback for truly unexpected column types, though less likely now
                 new_columns.append(str(col).upper())
         data.columns = new_columns
 
         # Ensure required columns are present and properly named for TA-Lib
         required_columns = ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']
 
-        # Check if all required columns exist after standardization
         if not all(col in data.columns for col in required_columns):
-            # As auto_adjust=True makes 'Adj Close' become 'Close', this check is mostly
-            # for ensuring the initial data structure from yfinance is as expected.
             print(f"Missing required OHLCV data after standardization for {company_ticker}. "
                   f"Available columns: {data.columns.tolist()}")
             return None
@@ -71,20 +61,18 @@ def get_candlestick_patterns(company_ticker, start_date, end_date):
         data['HIGH'] = pd.to_numeric(data['HIGH'], errors='coerce')
         data['LOW'] = pd.to_numeric(data['LOW'], errors='coerce')
         data['CLOSE'] = pd.to_numeric(data['CLOSE'], errors='coerce')
-        data['VOLUME'] = pd.to_numeric(data['VOLUME'], errors='coerce') # Also coerce volume
+        data['VOLUME'] = pd.to_numeric(data['VOLUME'], errors='coerce')
 
         # Drop rows with any NaN values in the OHLCV columns, as TA-Lib functions require non-NaN inputs
-        data.dropna(subset=['OPEN', 'HIGH', 'LOW', 'CLOSE'], inplace=True) # Volume sometimes allowed to be NaN
+        data.dropna(subset=['OPEN', 'HIGH', 'LOW', 'CLOSE'], inplace=True)
 
-        # Skip if not enough data after dropping NaNs
-        if data.shape[0] < 2: # Most patterns need at least 2 candles
+        if data.shape[0] < 2:
             print(f"Not enough valid OHLC data after cleaning for {company_ticker}.")
             return None
 
         for pattern_func_name, pattern_name in candlestick_patterns.items():
             pattern_function = getattr(talib, pattern_func_name, None)
             if pattern_function:
-                # Pass the Series to TA-Lib
                 pattern_result = pattern_function(
                     data['OPEN'], data['HIGH'], data['LOW'], data['CLOSE']
                 )
@@ -94,20 +82,32 @@ def get_candlestick_patterns(company_ticker, start_date, end_date):
                     date = idx.strftime('%Y-%m-%d')
                     val = pattern_result[idx]
                     pattern_type = "Bullish" if val > 0 else "Bearish"
+                    
+                    # Get the closing price for the detected pattern date
+                    closing_price = data.loc[idx, 'CLOSE']
+                    
+                    recommendation = ""
+                    if pattern_type == "Bullish":
+                        recommendation = "Consider Buy"
+                    elif pattern_type == "Bearish":
+                        recommendation = "Consider Sell"
+                    else:
+                        recommendation = "Neutral" # For patterns that don't clearly imply buy/sell
+
                     detected_patterns.append({
                         "Date": date,
                         "Pattern": pattern_name,
                         "Type": pattern_type,
-                        "Value": val
+                        "Closing Price": round(closing_price, 2), # Round to 2 decimal places
+                        "Recommendation": recommendation,
+                        "Value": val # Keep value for debugging/reference if needed
                     })
             else:
                 print(f"Warning: TA-Lib function for {pattern_func_name} not found.")
 
-
         if detected_patterns:
             patterns_df = pd.DataFrame(detected_patterns)
             patterns_df.sort_values(by="Date", inplace=True)
-            # Remove duplicate entries for the same date and pattern, keeping the first
             patterns_df.drop_duplicates(subset=['Date', 'Pattern'], keep='first', inplace=True)
             return patterns_df
         else:
@@ -118,37 +118,73 @@ def get_candlestick_patterns(company_ticker, start_date, end_date):
         print(f"An error occurred: {e}")
         return None
 
+def save_patterns_to_excel(df, company_name, ticker_symbol, filename_prefix="candlestick_patterns"):
+    """
+    Saves the DataFrame of candlestick patterns to an Excel file.
 
-# ▶️ Run analysis for two companies
+    Args:
+        df (pd.DataFrame): DataFrame containing the detected candlestick patterns.
+        company_name (str): The name of the company.
+        ticker_symbol (str): The ticker symbol of the company.
+        filename_prefix (str): Prefix for the Excel filename.
+    """
+    if df is not None and not df.empty:
+        # Create a filename using the company name and ticker symbol
+        safe_company_name = "".join([c for c in company_name if c.isalnum() or c == ' ']).strip()
+        safe_ticker_symbol = "".join([c for c in ticker_symbol if c.isalnum()]).strip()
+        
+        filename = f"{filename_prefix}_{safe_company_name}_{safe_ticker_symbol}.xlsx"
+        
+        # Add a "Company" column to the DataFrame before saving
+        df_to_save = df.copy()
+        df_to_save.insert(0, "Company", company_name) # Insert at the beginning
+
+        try:
+            # Drop the 'Value' column as it's more for internal logic/debugging than user output
+            if 'Value' in df_to_save.columns:
+                df_to_save = df_to_save.drop(columns=['Value'])
+            df_to_save.to_excel(filename, index=False)
+            print(f"Candlestick patterns saved to {filename}")
+        except Exception as e:
+            print(f"Error saving patterns to Excel for {company_name}: {e}")
+    else:
+        print(f"No patterns to save to Excel for {company_name}.")
+
+
+# ▶️ Run analysis for user-input company
 if __name__ == "__main__":
-    # Updated end_date to reflect current time for market data purposes.
-    # Note: Market data is typically updated after market close.
-    # For live data, you'd typically run this *after* the current day's market close.
-    # Using a future date ensures we get all available historical data up to yesterday.
-    end_date = "2025-06-27" # Using the provided current date from context
+    # Use current date as end date for up-to-date analysis
+    from datetime import datetime
+    end_date = datetime.now().strftime("%Y-%m-%d")
 
-    start_date = "2024-01-01"
+    while True:
+        company_name_input = input("Enter the company name (e.g., Reliance Industries, Apple Inc.) or 'exit' to quit: ").strip()
+        if company_name_input.lower() == 'exit':
+            break
 
-    # Example 1: Reliance
-    company_name = "Reliance Industries"
-    ticker_symbol = "RELIANCE.NS" # Reliance on NSE
-    print(f"Fetching candlestick patterns for {company_name} ({ticker_symbol}) from {start_date} to {end_date}...\n")
-    patterns = get_candlestick_patterns(ticker_symbol, start_date, end_date)
+        company_ticker_input = input(f"Enter the ticker symbol for {company_name_input} (e.g., RELIANCE.NS, AAPL): ").strip().upper()
+        if not company_ticker_input:
+            print("Ticker symbol cannot be empty. Please try again.")
+            continue
 
-    if patterns is not None:
-        print(f"Candlestick Patterns for {company_name} ({ticker_symbol}):")
-        print(patterns.to_string(index=False))
-    else:
-        print(f"Could not detect patterns for {company_name} ({ticker_symbol}).")
+        start_date_input = input("Enter the start date (YYYY-MM-DD, e.g., 2024-01-01): ").strip()
+        # Basic date format validation (can be improved)
+        try:
+            datetime.strptime(start_date_input, "%Y-%m-%d")
+        except ValueError:
+            print("Invalid start date format. Using default '2024-01-01'. Please use YYYY-MM-DD.")
+            start_date_input = "2024-01-01"
 
-    # Example 2: Apple
-    company_name_2 = "Apple Inc."
-    ticker_symbol_2 = "AAPL" # Apple on NASDAQ
-    print(f"\n--- Another Example: {company_name_2} ({ticker_symbol_2}) ---")
-    patterns2 = get_candlestick_patterns(ticker_symbol_2, "2024-03-01", end_date)
 
-    if patterns2 is not None:
-        print(f"Candlestick Patterns for {company_name_2} ({ticker_symbol_2}):")
-        print(patterns2.to_string(index=False))
-    else:
-        print(f"Could not detect patterns for {company_name_2} ({ticker_symbol_2}).")
+        print(f"\nFetching candlestick patterns for {company_name_input} ({company_ticker_input}) from {start_date_input} to {end_date}...\n")
+        
+        patterns = get_candlestick_patterns(company_ticker_input, start_date_input, end_date)
+
+        if patterns is not None:
+            print(f"Candlestick Patterns for {company_name_input} ({company_ticker_input}):")
+            print(patterns.to_string(index=False))
+            save_patterns_to_excel(patterns, company_name_input, company_ticker_input)
+        else:
+            print(f"Could not detect patterns for {company_name_input} ({company_ticker_input}).")
+        
+        print("\n" + "="*50 + "\n") # Separator for next input
