@@ -1,125 +1,154 @@
-import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import talib
-import matplotlib.pyplot as plt
-from io import BytesIO
 
-st.set_page_config(layout="wide")
+def get_candlestick_patterns(company_ticker, start_date, end_date):
+    try:
+        # Download historical data
+        # Use auto_adjust=True for adjusted prices, and progress=False for cleaner output
+        data = yf.download(company_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
 
-st.title("📈 Multi-Timeframe Candlestick Pattern Detector with Indicators")
+        if data.empty:
+            print(f"No data found for {company_ticker} between {start_date} and {end_date}.")
+            return None
 
-# --- Stock Selection ---
-stock = st.text_input("Enter NSE stock symbol (e.g., TATAMOTORS.NS):", "TATAMOTORS.NS").upper()
-timeframe = st.selectbox("Select Timeframe:", ["1d", "1h", "15m"])
+        # --- FIX STARTS HERE ---
+        # If columns are MultiIndex, flatten them to a single level
+        if isinstance(data.columns, pd.MultiIndex):
+            # Option 1: Access the first level of the MultiIndex (usually the OHLCV names)
+            data.columns = data.columns.get_level_values(0)
+            # Or, if you want to include the ticker, you could do:
+            # data.columns = [f"{col[0]}_{col[1]}" for col in data.columns]
+            # But for TA-Lib, just the OHLCV name is needed.
+        # --- FIX ENDS HERE ---
 
-period_map = {"1d": "1y", "1h": "60d", "15m": "7d"}
-interval_map = {"1d": "1d", "1h": "60m", "15m": "15m"}
+        # Standardize column names to uppercase
+        new_columns = []
+        for col in data.columns:
+            if isinstance(col, str):
+                new_columns.append(col.upper())
+            else:
+                # Fallback for truly unexpected column types, though less likely now
+                new_columns.append(str(col).upper())
+        data.columns = new_columns
 
-selected_period = period_map[timeframe]
-selected_interval = interval_map[timeframe]
+        # Ensure required columns are present and properly named for TA-Lib
+        required_columns = ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']
 
-# --- Download Data ---
-data_load_state = st.text("Loading data...")
-data = yf.download(stock, period=selected_period, interval=selected_interval)
-data_load_state.text("Data loaded!")
+        # Check if all required columns exist after standardization
+        if not all(col in data.columns for col in required_columns):
+            # As auto_adjust=True makes 'Adj Close' become 'Close', this check is mostly
+            # for ensuring the initial data structure from yfinance is as expected.
+            print(f"Missing required OHLCV data after standardization for {company_ticker}. "
+                  f"Available columns: {data.columns.tolist()}")
+            return None
 
-if data.empty:
-    st.error(f"No data found for {stock}. Please check the symbol.")
-    st.stop()
+        # Define candlestick patterns to detect
+        candlestick_patterns = {
+            "CDLDOJI": "Doji",
+            "CDLHAMMER": "Hammer",
+            "CDLINVERTEDHAMMER": "Inverted Hammer",
+            "CDLMORNINGSTAR": "Morning Star",
+            "CDLEVENINGSTAR": "Evening Star",
+            "CDLENGULFING": "Engulfing",
+            "CDLPIERCING": "Piercing Pattern",
+            "CDLDARKCLOUDCOVER": "Dark Cloud Cover",
+            "CDLHARAMI": "Harami",
+            "CDLHARAMICROSS": "Harami Cross",
+            "CDL3WHITESOLDIERS": "Three White Soldiers",
+            "CDL3BLACKCROWS": "Three Black Crows",
+            "CDLDRAGONFLYDOJI": "Dragonfly Doji",
+            "CDLGRAVESTONEDOJI": "Gravestone Doji",
+            "CDLMARUBOZU": "Marubozu",
+            "CDLSHOOTINGSTAR": "Shooting Star",
+            "CDLHANGINGMAN": "Hanging Man"
+        }
 
-# --- Indicators & Patterns ---
-data["RSI"] = talib.RSI(data["Close"], timeperiod=14)
-data["MACD"], data["MACD_signal"], data["MACD_hist"] = talib.MACD(data["Close"], fastperiod=12, slowperiod=26, signalperiod=9)
-data["ADX"] = talib.ADX(data["High"], data["Low"], data["Close"], timeperiod=14)
-data["BB_upper"], data["BB_middle"], data["BB_lower"] = talib.BBANDS(data["Close"], timeperiod=20)
+        detected_patterns = []
 
-data["bullish_engulfing"] = talib.CDLENGULFING(data["Open"], data["High"], data["Low"], data["Close"])
-data["morning_star"] = talib.CDLMORNINGSTAR(data["Open"], data["High"], data["Low"], data["Close"], penetration=0.3)
-data["three_white_soldiers"] = talib.CDL3WHITESOLDIERS(data["Open"], data["High"], data["Low"], data["Close"])
-data["volume_avg"] = data["Volume"].rolling(20).mean()
-data["volume_spike"] = data["Volume"] > 1.5 * data["volume_avg"]
+        # Ensure that the Series passed to TA-Lib functions are numeric
+        data['OPEN'] = pd.to_numeric(data['OPEN'], errors='coerce')
+        data['HIGH'] = pd.to_numeric(data['HIGH'], errors='coerce')
+        data['LOW'] = pd.to_numeric(data['LOW'], errors='coerce')
+        data['CLOSE'] = pd.to_numeric(data['CLOSE'], errors='coerce')
+        data['VOLUME'] = pd.to_numeric(data['VOLUME'], errors='coerce') # Also coerce volume
 
-# --- Signal Logic ---
-data["Buy"] = (
-    (data["bullish_engulfing"] > 0) |
-    (data["morning_star"] > 0) |
-    (data["three_white_soldiers"] > 0)
-) & (data["RSI"] < 30) & (data["volume_spike"])
+        # Drop rows with any NaN values in the OHLCV columns, as TA-Lib functions require non-NaN inputs
+        data.dropna(subset=['OPEN', 'HIGH', 'LOW', 'CLOSE'], inplace=True) # Volume sometimes allowed to be NaN
 
-data["Sell"] = data["RSI"] > 70
+        # Skip if not enough data after dropping NaNs
+        if data.shape[0] < 2: # Most patterns need at least 2 candles
+            print(f"Not enough valid OHLC data after cleaning for {company_ticker}.")
+            return None
 
-# --- Support & Resistance ---
-data["Support"] = data["Low"].rolling(20).min()
-data["Resistance"] = data["High"].rolling(20).max()
+        for pattern_func_name, pattern_name in candlestick_patterns.items():
+            pattern_function = getattr(talib, pattern_func_name, None)
+            if pattern_function:
+                # Pass the Series to TA-Lib
+                pattern_result = pattern_function(
+                    data['OPEN'], data['HIGH'], data['LOW'], data['CLOSE']
+                )
+                matches = pattern_result[pattern_result != 0]
 
-# --- Signal Table ---
-signal_df = data[(data["Buy"] | data["Sell"])][["Close", "RSI", "MACD", "ADX", "Buy", "Sell"]]
-signal_df = signal_df.copy()
-signal_df["Signal"] = np.where(signal_df["Buy"], "Buy", "Sell")
-signal_df.reset_index(inplace=True)
-signal_df = signal_df[["Datetime" if timeframe != "1d" else "Date", "Signal", "Close", "RSI", "MACD", "ADX"]]
+                for idx in matches.index:
+                    date = idx.strftime('%Y-%m-%d')
+                    val = pattern_result[idx]
+                    pattern_type = "Bullish" if val > 0 else "Bearish"
+                    detected_patterns.append({
+                        "Date": date,
+                        "Pattern": pattern_name,
+                        "Type": pattern_type,
+                        "Value": val
+                    })
+            else:
+                print(f"Warning: TA-Lib function for {pattern_func_name} not found.")
 
-st.subheader("🔔 Buy/Sell Signals")
-st.dataframe(signal_df)
 
-# --- Export to Excel ---
-excel = BytesIO()
-with pd.ExcelWriter(excel, engine='xlsxwriter') as writer:
-    signal_df.to_excel(writer, index=False, sheet_name="Signals")
-    writer.save()
-st.download_button(
-    label="📥 Download Signal Report",
-    data=excel.getvalue(),
-    file_name=f"{stock}_{timeframe}_signals.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+        if detected_patterns:
+            patterns_df = pd.DataFrame(detected_patterns)
+            patterns_df.sort_values(by="Date", inplace=True)
+            # Remove duplicate entries for the same date and pattern, keeping the first
+            patterns_df.drop_duplicates(subset=['Date', 'Pattern'], keep='first', inplace=True)
+            return patterns_df
+        else:
+            print(f"No candlestick patterns detected for {company_ticker}.")
+            return None
 
-# --- Main Price Chart ---
-st.subheader("📊 Candlestick Chart with Signals")
-fig, ax = plt.subplots(figsize=(14, 6))
-ax.plot(data.index, data["Close"], label="Close", color="black")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
 
-# Buy/Sell markers
-buy_signals = data[data["Buy"]]
-ax.scatter(buy_signals.index, buy_signals["Close"], marker="^", color="green", label="Buy", s=100)
-sell_signals = data[data["Sell"]]
-ax.scatter(sell_signals.index, sell_signals["Close"], marker="v", color="red", label="Sell", s=100)
 
-# Support/Resistance
-ax.plot(data.index, data["Support"], linestyle="--", color="blue", alpha=0.5, label="Support")
-ax.plot(data.index, data["Resistance"], linestyle="--", color="orange", alpha=0.5, label="Resistance")
+# ▶️ Run analysis for two companies
+if __name__ == "__main__":
+    # Updated end_date to reflect current time for market data purposes.
+    # Note: Market data is typically updated after market close.
+    # For live data, you'd typically run this *after* the current day's market close.
+    # Using a future date ensures we get all available historical data up to yesterday.
+    end_date = "2025-06-27" # Using the provided current date from context
 
-# Bollinger Bands
-ax.plot(data.index, data["BB_upper"], linestyle=":", color="gray", alpha=0.4, label="BB Upper")
-ax.plot(data.index, data["BB_middle"], linestyle=":", color="gray", alpha=0.3, label="BB Middle")
-ax.plot(data.index, data["BB_lower"], linestyle=":", color="gray", alpha=0.4, label="BB Lower")
+    start_date = "2024-01-01"
 
-ax.set_title(f"{stock} - {timeframe} Signals with Support, Resistance, BB")
-ax.set_xlabel("Time")
-ax.set_ylabel("Price")
-ax.legend()
-ax.grid(True)
-st.pyplot(fig)
+    # Example 1: Reliance
+    company_name = "Reliance Industries"
+    ticker_symbol = "RELIANCE.NS" # Reliance on NSE
+    print(f"Fetching candlestick patterns for {company_name} ({ticker_symbol}) from {start_date} to {end_date}...\n")
+    patterns = get_candlestick_patterns(ticker_symbol, start_date, end_date)
 
-# --- MACD Plot ---
-st.subheader("📉 MACD")
-fig2, ax2 = plt.subplots(figsize=(14, 3))
-ax2.plot(data.index, data["MACD"], label="MACD", color="blue")
-ax2.plot(data.index, data["MACD_signal"], label="Signal Line", color="orange")
-ax2.bar(data.index, data["MACD_hist"], color="gray", label="Histogram")
-ax2.legend()
-ax2.grid(True)
-st.pyplot(fig2)
+    if patterns is not None:
+        print(f"Candlestick Patterns for {company_name} ({ticker_symbol}):")
+        print(patterns.to_string(index=False))
+    else:
+        print(f"Could not detect patterns for {company_name} ({ticker_symbol}).")
 
-# --- ADX Plot ---
-st.subheader("📈 ADX")
-fig3, ax3 = plt.subplots(figsize=(14, 2.5))
-ax3.plot(data.index, data["ADX"], label="ADX", color="purple")
-ax3.axhline(25, linestyle="--", color="gray", alpha=0.5, label="Threshold")
-ax3.legend()
-ax3.grid(True)
-st.pyplot(fig3)
+    # Example 2: Apple
+    company_name_2 = "Apple Inc."
+    ticker_symbol_2 = "AAPL" # Apple on NASDAQ
+    print(f"\n--- Another Example: {company_name_2} ({ticker_symbol_2}) ---")
+    patterns2 = get_candlestick_patterns(ticker_symbol_2, "2024-03-01", end_date)
 
-st.caption("Developed using yfinance, TA-Lib, and Streamlit. 📈")
+    if patterns2 is not None:
+        print(f"Candlestick Patterns for {company_name_2} ({ticker_symbol_2}):")
+        print(patterns2.to_string(index=False))
+    else:
+        print(f"Could not detect patterns for {company_name_2} ({ticker_symbol_2}).")
